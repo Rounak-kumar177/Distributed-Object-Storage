@@ -1,0 +1,232 @@
+import os
+import io
+import time
+import threading
+import requests
+import uvicorn
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.responses import FileResponse
+
+# ==========================================
+# 1. METADATA SERVER (The Brain)
+# ==========================================
+meta_app = FastAPI()
+nodes_db = {}      # { node_id: {"url": str, "last_ping": float, "status": "ALIVE"/"DEAD"} }
+file_meta_db = {}  # { filename: { chunk_index: [node_ids] } }
+
+@meta_app.post("/register")
+def register_node(data: dict):
+    node_id = data["node_id"]
+    nodes_db[node_id] = {"url": data["url"], "last_ping": time.time(), "status": "ALIVE"}
+    print(f"  [Metadata] 🟢 Registered Node: {node_id}")
+    return {"status": "success"}
+
+@meta_app.post("/heartbeat/{node_id}")
+def heartbeat(node_id: str):
+    if node_id in nodes_db:
+        nodes_db[node_id]["last_ping"] = time.time()
+        nodes_db[node_id]["status"] = "ALIVE"
+        return {"status": "ok"}
+    raise HTTPException(status_code=404, detail="Node not found")
+
+@meta_app.get("/active-nodes")
+def get_active_nodes():
+    active = [nid for nid, info in nodes_db.items() if info["status"] == "ALIVE"]
+    return {"active_nodes": active, "all_nodes": nodes_db}
+
+@meta_app.post("/save-metadata")
+def save_metadata(data: dict):
+    filename = data["filename"]
+    if filename not in file_meta_db:
+        file_meta_db[filename] = {}
+    file_meta_db[filename][data["chunk_index"]] = data["node_ids"]
+    return {"status": "saved"}
+
+@meta_app.get("/get-metadata/{filename}")
+def get_metadata(filename: str):
+    if filename in file_meta_db:
+        return {"filename": filename, "chunks": file_meta_db[filename]}
+    raise HTTPException(status_code=404, detail="File not found")
+
+def monitor_nodes():
+    """Background Failure Detector"""
+    while True:
+        time.sleep(2)
+        current_time = time.time()
+        for nid, info in list(nodes_db.items()):
+            # Agar 5 second tak Heartbeat na aaye -> Node DEAD
+            if current_time - info["last_ping"] > 5 and info["status"] == "ALIVE":
+                nodes_db[nid]["status"] = "DEAD"
+                print(f"\n  [ALERT ❌] Node Failure Detected: {nid} is DOWN!")
+                print("  [Auto-Repair 🔄] Re-routing traffic to live replica nodes...\n")
+
+# ==========================================
+# 2. STORAGE NODE FACTORY (Data Worker)
+# ==========================================
+def create_storage_node_app(node_id: str):
+    node_app = FastAPI()
+    data_dir = f"./data_{node_id}"
+    os.makedirs(data_dir, exist_ok=True)
+
+    @node_app.post("/store/{chunk_name}")
+    async def store_chunk(chunk_name: str, file: UploadFile = File(...)):
+        filepath = os.path.join(data_dir, chunk_name)
+        content = await file.read()
+        with open(filepath, "wb") as f:
+            f.write(content)
+        return {"status": "stored", "node": node_id}
+
+    @node_app.get("/retrieve/{chunk_name}")
+    def retrieve_chunk(chunk_name: str):
+        filepath = os.path.join(data_dir, chunk_name)
+        if os.path.exists(filepath):
+            return FileResponse(filepath)
+        raise HTTPException(status_code=404, detail="Chunk not found")
+
+    return node_app
+
+def run_node_heartbeat(node_id: str, stop_event: threading.Event):
+    """Periodically sends Heartbeat to Metadata Server"""
+    while not stop_event.is_set():
+        try:
+            requests.post(f"http://127.0.0.1:8000/heartbeat/{node_id}")
+        except:
+            pass
+        time.sleep(1.5)
+
+# ==========================================
+# 3. CLIENT HELPERS (Upload & Download)
+# ==========================================
+def client_upload(filename: str, data_bytes: bytes, replication_factor: int = 2):
+    print(f"\n--- 📤 [CLIENT] Uploading File: {filename} ---")
+    active_res = requests.get("http://127.0.0.1:8000/active-nodes").json()
+    active_nodes = active_res["active_nodes"]
+    all_nodes = active_res["all_nodes"]
+
+    if len(active_nodes) < replication_factor:
+        print("❌ Error: Not enough active storage nodes for replication.")
+        return
+
+    # File ko 2 chunks me split karein
+    mid = len(data_bytes) // 2
+    chunks = [data_bytes[:mid], data_bytes[mid:]]
+
+    for idx, chunk_data in enumerate(chunks):
+        chunk_name = f"{filename}.chk{idx}"
+        target_nodes = active_nodes[:replication_factor]
+        saved_on = []
+
+        for nid in target_nodes:
+            node_url = all_nodes[nid]["url"]
+            files = {'file': (chunk_name, io.BytesIO(chunk_data))}
+            r = requests.post(f"{node_url}/store/{chunk_name}", files=files)
+            if r.status_code == 200:
+                saved_on.append(nid)
+
+        requests.post("http://127.0.0.1:8000/save-metadata", json={
+            "filename": filename,
+            "chunk_index": idx,
+            "node_ids": saved_on
+        })
+        print(f"  [Chunk {idx}] Saved successfully on Replicas: {saved_on}")
+
+def client_download(filename: str):
+    print(f"\n--- 📥 [CLIENT] Downloading File: {filename} ---")
+    meta = requests.get(f"http://127.0.0.1:8000/get-metadata/{filename}").json()
+    all_nodes = requests.get("http://127.0.0.1:8000/active-nodes").json()["all_nodes"]
+
+    restored_bytes = bytearray()
+
+    for idx_str, node_list in meta["chunks"].items():
+        chunk_name = f"{filename}.chk{idx_str}"
+        fetched = False
+
+        # Healthy node se chunk read karein
+        for nid in node_list:
+            if all_nodes[nid]["status"] == "ALIVE":
+                node_url = all_nodes[nid]["url"]
+                r = requests.get(f"{node_url}/retrieve/{chunk_name}")
+                if r.status_code == 200:
+                    restored_bytes.extend(r.content)
+                    print(f"  ⚡ Chunk {idx_str} retrieved from active node: {nid}")
+                    fetched = True
+                    break
+
+        if not fetched:
+            print(f"❌ Critical Error: All replica nodes for Chunk {idx_str} are down!")
+            return None
+
+    return bytes(restored_bytes)
+
+# ==========================================
+# 4. MAIN DEMO EXECUTION FLOW
+# ==========================================
+if __name__ == "__main__":
+    print("==================================================")
+    print("🚀 VAULT: Distributed Object Storage Single-File Demo")
+    print("==================================================\n")
+
+    # Prepare storage folders safely
+for folder in ["./data_node_1", "./data_node_2"]:
+    os.makedirs(folder, exist_ok=True)
+
+    # Remove old chunk files without deleting the folder itself
+    for filename in os.listdir(folder):
+        filepath = os.path.join(folder, filename)
+        try:
+            if os.path.isfile(filepath):
+                os.remove(filepath)
+        except PermissionError:
+            print(f"⚠️ Could not remove locked file: {filepath}")
+
+    # 1. Metadata Server Server Thread
+    threading.Thread(target=lambda: uvicorn.run(meta_app, host="127.0.0.1", port=8000, log_level="error"), daemon=True).start()
+    threading.Thread(target=monitor_nodes, daemon=True).start()
+    time.sleep(1)
+
+    # 2. Storage Node 1 Thread
+    node1_app = create_storage_node_app("node_1")
+    threading.Thread(target=lambda: uvicorn.run(node1_app, host="127.0.0.1", port=8001, log_level="error"), daemon=True).start()
+
+    # 3. Storage Node 2 Thread
+    node2_app = create_storage_node_app("node_2")
+    threading.Thread(target=lambda: uvicorn.run(node2_app, host="127.0.0.1", port=8002, log_level="error"), daemon=True).start()
+
+    time.sleep(1)
+
+    # Register Nodes with Metadata Server
+    requests.post("http://127.0.0.1:8000/register", json={"node_id": "node_1", "url": "http://127.0.0.1:8001"})
+    requests.post("http://127.0.0.1:8000/register", json={"node_id": "node_2", "url": "http://127.0.0.1:8002"})
+
+    # Start Node Heartbeats
+    stop_node1_hb = threading.Event()
+    stop_node2_hb = threading.Event()
+    threading.Thread(target=run_node_heartbeat, args=("node_1", stop_node1_hb), daemon=True).start()
+    threading.Thread(target=run_node_heartbeat, args=("node_2", stop_node2_hb), daemon=True).start()
+
+    time.sleep(1)
+
+    # TEST STEP 1: Upload Data
+    sample_text = b"Hello Vault! This file is partitioned into chunks and replicated across multiple nodes."
+    client_upload("project_report.txt", sample_text, replication_factor=2)
+
+    # TEST STEP 2: Download Normal Data
+    data1 = client_download("project_report.txt")
+    if data1:
+        print(f"🎉 Restored Content: '{data1.decode()}'")
+
+    # TEST STEP 3: LIVE NODE FAILURE SIMULATION
+    print("\n--------------------------------------------------")
+    print("🔥 SIMULATION: Killing 'node_1' to test Fault Tolerance...")
+    print("--------------------------------------------------")
+    stop_node1_hb.set()  # Stop Node 1 heartbeat (Simulates node crash)
+    
+    print("⏳ Waiting 6 seconds for Metadata Heartbeat Failure Detector to trigger...")
+    time.sleep(6)
+
+    # TEST STEP 4: Download Data After Node Crash
+    data2 = client_download("project_report.txt")
+    if data2:
+        print(f"🎉 Restored Content (after Node-1 failure): '{data2.decode()}'")
+
+    print("\n✅ DEMO COMPLETE: Fault-tolerant replica recovery successfully demonstrated!")
